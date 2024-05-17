@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="14b5692b-fd14-4e6c-81a8-1ae139c8596e" name="16881">
+        <fileTransfer accessType="SFTP" host="connect.nmb1.seetacloud.com" port="16881" sshConfigId="cbbc99c8-d5e8-419e-99ee-609bbdff0953" sshConfig="root@connect.nmb1.seetacloud.com:16881 password">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>
