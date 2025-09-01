@@ -1,4 +1,3 @@
-cat > /root/4D-Humans/hmr2/physpt/adapter.py <<'PY'
 # hmr2/physpt/adapter.py
 # -*- coding: utf-8 -*-
 """
@@ -362,4 +361,3 @@ class PhysPTWrapper:
             cur = torch.cat([cur[:, 1:, :], q_next[:, None, :]], dim=1)
 
         return torch.stack(preds, dim=0).cpu().numpy()
-PY
