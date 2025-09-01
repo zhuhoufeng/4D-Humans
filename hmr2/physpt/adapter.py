@@ -97,9 +97,3 @@ def _find_model_entry(repo_dir: str):
                     return mod, bn
         except Exception as e:
             last_err = e
-
-    # 2) 回退：扫描 models 目录所有 .py
-    for fname in os.listdir(models_dir):
-        if not fname.endswith(".py") or fname.startswith("_"):
-            continue
-        mod_name = f"models.{f_
