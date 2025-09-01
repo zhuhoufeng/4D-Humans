@@ -1,11 +1,14 @@
 # hmr2/physpt/adapter.py
 # -*- coding: utf-8 -*-
 """
-PhysPT 适配器：
-- 自动在 third_party/PhysPT (或 PHYSPT_DIR) 中定位模型代码与 assets
-- 递归查找 assets 下的权重，并支持环境变量显式指定
-- 灵活实例化模型（类/工厂函数/已实例对象），加载多样式 state_dict
-- 提供 refine_window() 与 predict_next() 两个推理接口
+PhysPT 适配器（稳健版）：
+- 递归搜索 assets/** 权重；支持 PHYSPT_DIR / PHYSPT_ASSETS / PHYSPT_CKPT
+- 动态按文件路径加载 PhysPT 的 models/*.py（即使没有 __init__.py）
+- 自动读取 config.py / constants.py 提取默认参数
+- 实例化时按 PhysPT(device, seqlen, mode, f_dim, d_model, nhead, nlayers) 的“7 个位置参数”严格传参；
+  同时也尝试 kwargs 与 torch.device/字符串两种设备形式。
+- 兼容多种 state_dict 键名并去前缀
+- 提供 refine_window() / predict_next() 两个推理接口
 """
 
 import os
@@ -13,6 +16,7 @@ import sys
 import glob
 import types
 import importlib
+import importlib.util
 import inspect
 from typing import Dict, Tuple, Optional, Any, List
 
@@ -20,10 +24,10 @@ import numpy as np
 import torch
 
 
-# ----------------- 小工具 ----------------- #
+# =============== 基础工具 ===============
+
 def _strip_prefix_if_present(state_dict: Dict[str, torch.Tensor],
                              prefix_list=("module.", "model.", "net.", "network.")):
-    """去除常见前缀，便于灵活加载权重。"""
     if not isinstance(state_dict, dict):
         return state_dict
     new_sd = {}
@@ -55,122 +59,160 @@ def _list_some_files(root, maxn=50) -> List[str]:
     return out
 
 
-# ----------------- 定位模型入口 ----------------- #
-def _find_model_entry(repo_dir: str):
-    """
-    在 third_party/PhysPT/models/ 下寻找可用入口：
-    - 优先模块：models.physpt_model / models.model / models.network / models.physpt
-    - 入口名候选：build_model/get_model/create_model/PhysPT/PhysPTModel/Model/Net
-    返回: (module, entry_name)
-    """
-    models_dir = os.path.join(repo_dir, "models")
-    if not os.path.isdir(models_dir):
-        raise FileNotFoundError(f"未找到目录: {models_dir}")
+# =============== 动态加载/读取配置 ===============
 
+def _load_module_from_path(py_path: str, mod_name: str):
+    spec = importlib.util.spec_from_file_location(mod_name, py_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"无法为 {py_path} 构建导入 spec")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = mod
+    spec.loader.exec_module(mod)  # type: ignore
+    return mod
+
+
+def _gather_candidates(repo_dir: str) -> List[types.ModuleType]:
+    mods: List[types.ModuleType] = []
+    search_dirs = [
+        os.path.join(repo_dir, "models"),
+        repo_dir,
+    ]
+    counter = 0
+    for d in search_dirs:
+        if not os.path.isdir(d):
+            continue
+        for root, _, files in os.walk(d):
+            for fn in files:
+                if not fn.endswith(".py") or fn.startswith("_"):
+                    continue
+                path = os.path.join(root, fn)
+                base = fn.lower()
+                if ("physpt" in base) or ("model" in base) or ("network" in base) or ("net" in base):
+                    counter += 1
+                    mod_name = f"physpt_dyn_{counter}"
+                    try:
+                        mods.append(_load_module_from_path(path, mod_name))
+                    except Exception:
+                        pass
+    return mods
+
+
+def _load_cfg_and_consts(repo_dir: str):
     if repo_dir not in sys.path:
         sys.path.insert(0, repo_dir)
 
-    preferred_modules = [
-        "models.physpt_model",
-        "models.model",
-        "models.network",
-        "models.physpt",
-    ]
-    builder_names = [
-        "build_model",
-        "get_model",
-        "create_model",
-        "PhysPT",
-        "PhysPTModel",
-        "Model",
-        "Net",
-    ]
+    cfg_dict: Dict[str, Any] = {}
+    const_dict: Dict[str, Any] = {}
 
-    last_err = None
-
-    # 1) 先试首选模块
-    for mod_name in preferred_modules:
-        try:
-            mod = importlib.import_module(mod_name)
-            for bn in builder_names:
-                if hasattr(mod, bn):
-                    return mod, bn
-        except Exception as e:
-            last_err = e
-
-    # 2) 回退：扫描 models 目录所有 .py
-    for fname in os.listdir(models_dir):
-        if not fname.endswith(".py") or fname.startswith("_"):
-            continue
-        mod_name = f"models.{fname[:-3]}"
-        try:
-            mod = importlib.import_module(mod_name)
-            for bn in builder_names:
-                if hasattr(mod, bn):
-                    return mod, bn
-        except Exception as e:
-            last_err = e
-
-    raise ImportError(
-        f"未能在 {models_dir} 找到可用的模型构造函数/类；"
-        f"请确认 PhysPT 的 models/ 下存在如 build_model()/PhysPT 类等入口。\n"
-        f"最后错误：{last_err}"
-    )
-
-
-def _build_model_from(mod: types.ModuleType, entry: str):
-    """entry 可能是函数(工厂)或类，返回其对象或类本身。"""
-    obj = getattr(mod, entry)
-    if inspect.isfunction(obj):
-        return obj()
-    if inspect.isclass(obj):
-        # 注意：不在这里实例化，交由 _ensure_instance 统一处理
-        return obj
-    # 万一已经是实例
-    return obj
-
-
-def _ensure_instance(maybe_cls_or_obj):
-    """
-    若传入的是“类”，尽量实例化：
-      1) 尝试无参构造；
-      2) 尝试从 config.py 中获取默认配置 (Config / get_config / get_cfg)，再构造；
-      3) 失败则抛异常，让用户手动指定构造参数。
-    传入已是实例则原样返回。
-    """
-    if not inspect.isclass(maybe_cls_or_obj):
-        return maybe_cls_or_obj
-
-    cls = maybe_cls_or_obj
-
-    # 1) 无参构造
+    # config.py
     try:
-        return cls()
-    except TypeError:
-        pass
-
-    # 2) 使用 config.py
-    try:
-        cfg_mod = importlib.import_module("config")  # PhysPT 仓库根下通常有 config.py
-        for name in ("Config", "get_config", "get_cfg"):
-            if hasattr(cfg_mod, name):
-                factory = getattr(cfg_mod, name)
-                cfg = factory() if callable(factory) else factory
+        cfg_mod = importlib.import_module("config")
+        for n in dir(cfg_mod):
+            if n.startswith("_"): 
+                continue
+            obj = getattr(cfg_mod, n)
+            if callable(obj):
                 try:
-                    return cls(cfg)
+                    val = obj()
+                    cfg_dict[n.lower()] = val
+                except TypeError:
+                    pass
                 except Exception:
-                    continue
+                    pass
+            else:
+                cfg_dict[n.lower()] = obj
     except Exception:
         pass
 
-    # 3) 兜底
-    raise RuntimeError(
-        f"PhysPT 模型类 {cls.__name__} 需要构造参数，未能自动获取默认配置；"
-        f"请在 adapter.py 中自定义对 {cls.__name__}(...) 的构造传参。"
-    )
+    # constants.py
+    try:
+        c_mod = importlib.import_module("constants")
+        for n in dir(c_mod):
+            if n.startswith("_"): 
+                continue
+            const_dict[n.lower()] = getattr(c_mod, n)
+    except Exception:
+        pass
+
+    return cfg_dict, const_dict
 
 
-# ----------------- 主封装 ----------------- #
+def _find_entry_symbol(mods: List[types.ModuleType]):
+    # 1) 类名包含 PhysPT
+    for m in mods:
+        for n, obj in vars(m).items():
+            if inspect.isclass(obj) and "physpt" in n.lower():
+                return obj
+    # 2) 工厂函数
+    for m in mods:
+        for fname in ("build_model", "get_model", "create_model"):
+            if hasattr(m, fname) and callable(getattr(m, fname)):
+                return getattr(m, fname)
+    # 3) 备用：Model/Net
+    for m in mods:
+        for n, obj in vars(m).items():
+            if inspect.isclass(obj) and n.lower() in ("model", "net"):
+                return obj
+    raise ImportError("未找到 PhysPT 入口（类名包含 'PhysPT' 或 build_model/get_model/create_model）。")
+
+
+# =============== 构造入口（关键部分：7 个位置参数） ===============
+
+def _construct_entry(entry, device, cfg_dict, const_dict):
+    """
+    直接按 PhysPT(device, seqlen, mode, f_dim, d_model, nhead, nlayers) 构造；
+    1) kwargs + 字符串设备
+    2) kwargs + torch.device
+    3) 位置参数 + 字符串设备
+    4) 位置参数 + torch.device
+    """
+    # 设备字符串
+    if isinstance(device, torch.device):
+        device_str = device.type
+    elif isinstance(device, str):
+        device_str = 'cuda' if 'cuda' in device else 'cpu'
+    else:
+        device_str = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # 从 config/constants 拿参数（取不到就用默认值）
+    seqlen  = int(cfg_dict.get('seqlen', 16))
+    mode    = str(cfg_dict.get('mode', 'inference'))
+    f_dim   = int(const_dict.get('f_dim', 75))
+    d_model = int(const_dict.get('d_model', const_dict.get('hidden_dim', 256)))
+    nhead   = int(const_dict.get('nhead', const_dict.get('num_heads', 8)))
+    nlayers = int(const_dict.get('nlayers', const_dict.get('num_layers', 6)))
+
+    # ——— 1) kwargs + 字符串设备 ———
+    try:
+        return entry(device=device_str, seqlen=seqlen, mode=mode,
+                     f_dim=f_dim, d_model=d_model, nhead=nhead, nlayers=nlayers)
+    except Exception as e_kw_str:
+        last = e_kw_str
+
+    # ——— 2) kwargs + torch.device ———
+    try:
+        return entry(device=torch.device(device_str), seqlen=seqlen, mode=mode,
+                     f_dim=f_dim, d_model=d_model, nhead=nhead, nlayers=nlayers)
+    except Exception as e_kw_dev:
+        last = e_kw_dev
+
+    # ——— 3) 位置参数 + 字符串设备（严格 7 个）———
+    try:
+        return entry(device_str, seqlen, mode, f_dim, d_model, nhead, nlayers)
+    except Exception as e_pos_str:
+        last = e_pos_str
+
+    # ——— 4) 位置参数 + torch.device ———
+    try:
+        return entry(torch.device(device_str), seqlen, mode, f_dim, d_model, nhead, nlayers)
+    except Exception as e_pos_dev:
+        last = e_pos_dev
+
+    raise RuntimeError(f"无法实例化/构造 PhysPT 模型；最后错误：{last}")
+
+
+# =============== 主封装 ===============
+
 class PhysPTWrapper:
     """
     统一封装 PhysPT 推理接口：
@@ -183,10 +225,10 @@ class PhysPTWrapper:
     """
 
     def __init__(self, physpt_repo_dir: str, device: str = "cuda"):
-        # ---------- 设备 ----------
+        # 设备
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
 
-        # ---------- 允许用环境变量覆盖根目录 ----------
+        # 环境变量覆盖根目录
         env_repo = os.environ.get("PHYSPT_DIR")
         if env_repo:
             physpt_repo_dir = env_repo
@@ -195,24 +237,22 @@ class PhysPTWrapper:
         if self.repo not in sys.path:
             sys.path.insert(0, self.repo)
 
-        # ---------- 定位 assets ----------
+        # assets
         assets_dir = os.environ.get("PHYSPT_ASSETS") or os.path.join(self.repo, "assets")
         assets_dir = os.path.abspath(assets_dir)
 
-        # 递归查找候选权重
+        # 递归找权重
         patterns = ["**/*.pth", "**/*.pt", "**/*.ckpt", "**/*.pth.tar", "**/*.bin", "**/*.pkl"]
         candidates: List[str] = []
         if os.path.isdir(assets_dir):
             for pat in patterns:
                 candidates += glob.glob(os.path.join(assets_dir, pat), recursive=True)
 
-        # 如果用户指定了确切 ckpt 路径，优先用它
         ckpt_env = os.environ.get("PHYSPT_CKPT")
         if ckpt_env and os.path.isfile(ckpt_env):
             ckpt = os.path.abspath(ckpt_env)
         else:
             if not candidates:
-                # 打印 assets 下的部分文件帮助定位
                 preview = _list_some_files(assets_dir, maxn=50)
                 hint = f"\n[PhysPT] assets 路径: {assets_dir}"
                 if preview:
@@ -224,29 +264,25 @@ class PhysPTWrapper:
                     "可设置环境变量 PHYSPT_ASSETS=<绝对路径> 或 PHYSPT_CKPT=<权重文件>。"
                     + hint
                 )
-
-            # 优先选择文件名包含 'physpt' 的候选；否则取体积最大者
             preferred = [p for p in candidates if "physpt" in os.path.basename(p).lower()]
             pick_from = preferred if preferred else candidates
             ckpt = sorted(pick_from, key=lambda p: (-os.path.getsize(p), p))[0]
 
         print(f"[PhysPT] 使用权重: {ckpt}")
 
-        # ---------- 构建模型 ----------
-        mod, entry = _find_model_entry(self.repo)
-        model_obj_or_cls = _build_model_from(mod, entry)
-        self.model = _ensure_instance(model_obj_or_cls)
+        # 构建模型（动态加载 + 7 位置参数兜底）
+        cfg_dict, const_dict = _load_cfg_and_consts(self.repo)
+        mods = _gather_candidates(self.repo)
+        entry = _find_entry_symbol(mods)
+        self.model = _construct_entry(entry, self.device, cfg_dict, const_dict)
 
-        # ---------- 加载权重 ----------
+        # 加载权重
         state = torch.load(ckpt, map_location="cpu")
-
-        # 兼容多种保存格式：优先取常见键，否则若直接就是 state_dict 也 OK
         if isinstance(state, dict):
             for k in ("state_dict", "model", "model_state_dict", "net", "network", "weights", "params"):
                 if k in state and isinstance(state[k], dict):
                     state = state[k]
                     break
-
         if isinstance(state, dict):
             state = _strip_prefix_if_present(state)
 
@@ -255,20 +291,16 @@ class PhysPTWrapper:
             self.model.load_state_dict(state, strict=False)
             loaded = True
         except Exception:
-            # 有些工程真正的 nn.Module 在 .model
             if hasattr(self.model, "model") and hasattr(self.model.model, "load_state_dict"):
                 self.model.model.load_state_dict(state, strict=False)
                 loaded = True
-
         if not loaded:
             raise RuntimeError("无法将 checkpoint 加载到 PhysPT 模型，请检查模型类与权重是否匹配。")
 
         self.model.to(self.device).eval()
-
-        # 可调阈值：关联阶段若构建 E_c（接触一致性）可用
         self.contact_threshold = 1.0
 
-    # ----------------- 推理：窗口精炼 ----------------- #
+    # ------- 推理：窗口精炼 ------- #
     @torch.no_grad()
     def refine_window(
         self,
@@ -276,17 +308,10 @@ class PhysPTWrapper:
         beta: np.ndarray,
         ground_plane: Optional[np.ndarray] = None
     ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
-        """
-        对 (T,75) 的窗口做物理一致性精炼。
-        返回:
-          q_refined: (T,75) numpy
-          forces:  可能包含 'lambda' (T, Nc*3), 'tau' (T,75), 'contacts'(T, Nc) 等
-        """
         q = _safe_to_tensor(q_window, self.device)
         b = _safe_to_tensor(beta, self.device)
         plane = None if ground_plane is None else _safe_to_tensor(ground_plane, self.device)
 
-        # 根据不同实现尝试前向函数名
         outputs: Dict[str, Any] = {}
         if hasattr(self.model, "forward_refine"):
             outputs = self.model.forward_refine(q, b, plane)
@@ -296,10 +321,9 @@ class PhysPTWrapper:
             out = self.model(q, b, plane)
             outputs = out if isinstance(out, dict) else {"q_refined": out}
 
-        # 解析结果
         if "q_refined" in outputs and torch.is_tensor(outputs["q_refined"]):
             q_refined = outputs["q_refined"].detach().cpu().numpy()
-            if q_refined.ndim == 3:  # (B,T,75)
+            if q_refined.ndim == 3:
                 q_refined = q_refined[0]
         elif "q" in outputs and torch.is_tensor(outputs["q"]):
             q_refined = outputs["q"].detach().cpu().numpy()
@@ -318,7 +342,7 @@ class PhysPTWrapper:
 
         return q_refined, forces
 
-    # ----------------- 推理：自回归外推未来 n 帧 ----------------- #
+    # ------- 推理：自回归外推 ------- #
     @torch.no_grad()
     def predict_next(
         self,
@@ -327,9 +351,6 @@ class PhysPTWrapper:
         ground_plane: Optional[np.ndarray] = None,
         n_future: int = 1
     ) -> np.ndarray:
-        """
-        自回归方式外推未来 n_future 帧，返回 (n_future, 75) numpy。
-        """
         q = _safe_to_tensor(q_window, self.device)
         b = _safe_to_tensor(beta, self.device)
         plane = None if ground_plane is None else _safe_to_tensor(ground_plane, self.device)
@@ -352,12 +373,10 @@ class PhysPTWrapper:
             elif torch.is_tensor(out):
                 q_next = out[:, -1, :] if out.ndim == 3 else out
             else:
-                raise RuntimeError("PhysPT 推理未返回 'q_next' 或 'q_refined' 可用于外推。")
+                raise RuntimeError("PhysPT 推理未返回 'q_next' 或 'q_refined'。")
 
             q_next = q_next.detach()
             preds.append(q_next.squeeze(0))
-
-            # 自回归滚动
             cur = torch.cat([cur[:, 1:, :], q_next[:, None, :]], dim=1)
 
         return torch.stack(preds, dim=0).cpu().numpy()
